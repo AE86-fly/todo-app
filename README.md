@@ -328,12 +328,23 @@ Docker Hub 直连在这台机器上也不通，靠 daemon 配置的国内 mirror
 ./scripts/act.sh                 # 跑全部
 ```
 
-**包装脚本解决的是这台机器特有的问题**：`github.com` 直连不通，而 act 默认会用
-`git clone` 从 github.com 拉取每一个 `uses:` 引用的 action，于是任何 workflow 都挂在第一步。
-但 `codeload.github.com` 是通的，所以脚本先从那里抓 tarball 缓存到本地，
-再用 act 的 `--local-repository` 映射过去 —— **workflow 文件一个字都不用改**。
+脚本默认就是普通的 act 调用，act 自己从 github.com 拉 action。
 
+**留了一个兜底开关**，因为 github.com 在这台机器上是**间歇性**的：
+
+```bash
+ACT_LOCAL_ACTIONS=1 ./scripts/act.sh -j backend
+```
+
+它先从 `codeload.github.com`（比主站稳定得多）抓 action 的 tarball 到本地，
+再用 act 的 `--local-repository` 映射过去。**workflow 文件一个字都不用改** ——
 这个取舍是刻意的：改 workflow 去迁就本机，就等于验证了另一份东西。
+
+为什么需要兜底：**act 的 `git clone` 没有重试**，一次超时就废掉整个 job。
+实测遇到过一次（`dial tcp 20.205.243.166:443: i/o timeout`），但同一时期
+连续 10 次访问 github.com 又全部正常 —— 是连接会被中途掐断，不是稳定不可达。
+
+（顺带一提，真正稳定不通的是 `proxy.golang.org`，那个每次都超时，和这个是两回事。）
 
 **已知限制**：
 
