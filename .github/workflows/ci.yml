@@ -15,10 +15,16 @@
 #    推到 GitHub 之后它才会真正生效 —— 在那之前，请不要把它当作
 #    "CI 是通的"的证据。
 #
-# 特意没有 deploy job。原教程里那个 appleboy/ssh-action 的部署步骤需要
-# 一整套真实基础设施（服务器、SSH 私钥、registry 写权限、服务器上已有的
-# 源码或可拉的镜像），写进来只会让它"看起来完整"，实际既无法执行
-# 也无法验证。部署怎么做取决于你的实际环境，不该由模板猜。
+# 有 publish job（推镜像到 ghcr.io），但**仍然没有 deploy job**。
+#
+# 区别在于：推镜像只需要 GitHub 自己发的 GITHUB_TOKEN，不需要任何外部凭据，
+# 是真正能跑通的；而原教程里那个 appleboy/ssh-action 的部署步骤需要一整套
+# 真实基础设施（服务器、SSH 私钥、服务器上的目录），写进来只会让它
+# "看起来完整"，实际既无法执行也无法验证。
+#
+# 部署端怎么消费推出来的镜像，README 里有说明（compose 的 API_IMAGE /
+# WEB_IMAGE 两个钩子就是为此预留的）。具体怎么部署取决于你的环境，
+# 不该由模板猜。
 
 name: CI
 
@@ -125,3 +131,60 @@ jobs:
       - name: 失败时导出日志
         if: failure()
         run: docker compose logs
+
+  # 测试全过了才推镜像。三个 job 都 needs 上，任何一个挂了都不会推 ——
+  # 避免"测试失败但镜像已经发出去了"这种最难收拾的状态。
+  publish:
+    needs: [backend, web, e2e]
+    # 只在 main 的 push 上推。PR 也推的话，任何人都能往 registry 里塞镜像。
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # ghcr 需要这个才能推
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ghcr 的镜像路径必须全小写，而 github.repository 的大小写跟随用户名
+      # 和仓库名。直接拼会在 push 时被 registry 拒掉，报错信息很难指向根因。
+      # ${VAR,,} 是 bash 的小写展开。
+      - name: 计算镜像前缀（转小写）
+        run: echo "IMAGE_PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 两个 tag：sha-<commit> 用于精确定位和回滚，latest 用于"就要最新的"。
+      # 只推 latest 的话，出问题想回退都找不到旧镜像。
+      - name: 推 api 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/api:sha-${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}/api:latest
+          # gha 缓存配合 Dockerfile 里已有的 BuildKit cache mount，
+          # 第二次之后的构建会快很多。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 推 web 镜像
+        uses: docker/build-push-action@v6
+        with:
+          # 上下文是项目根而不是 web/：web/Dockerfile 要 COPY nginx/nginx.conf
+          context: .
+          file: web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/web:sha-${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}/web:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
