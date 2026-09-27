@@ -1,0 +1,1156 @@
+# 完整版扩展：PostgreSQL + JWT 认证 + CI/CD
+
+在上一版基础上，补上三块生产必备能力。代码较多，我按顺序给出，最后给完整启动方式。
+
+---
+
+## 一、PostgreSQL 接入
+
+### 1. 数据模型（GORM）
+
+**backend/internal/model/user.go**
+```go
+package model
+
+import "time"
+
+type User struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Username  string    `gorm:"uniqueIndex;size:64;not null" json:"username"`
+	Password  string    `gorm:"size:255;not null" json:"-"` // json:"-" 不返回密码
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type Todo struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	UserID    uint      `gorm:"index;not null" json:"userId"`
+	Title     string    `gorm:"size:255;not null" json:"title"`
+	Done      bool      `gorm:"default:false" json:"done"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+```
+
+### 2. 数据库连接
+
+**backend/internal/db/db.go**
+```go
+package db
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"todo-app/internal/model"
+)
+
+var DB *gorm.DB
+
+func Init() {
+	dsn := fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=Asia/Shanghai",
+		env("DB_HOST", "localhost"),
+		env("DB_USER", "postgres"),
+		env("DB_PASSWORD", "postgres"),
+		env("DB_NAME", "todo"),
+		env("DB_PORT", "5432"),
+	)
+
+	var err error
+	// 重试等待数据库就绪（容器启动顺序问题）
+	for i := 0; i < 10; i++ {
+		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err == nil {
+			break
+		}
+		log.Printf("等待数据库... (%d/10)", i+1)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatal("数据库连接失败:", err)
+	}
+
+	// 自动建表
+	if err := DB.AutoMigrate(&model.User{}, &model.Todo{}); err != nil {
+		log.Fatal("迁移失败:", err)
+	}
+	log.Println("数据库就绪")
+}
+
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+```
+
+### 3. 用数据库重写 Store
+
+**backend/internal/store/store.go**
+```go
+package store
+
+import (
+	"todo-app/internal/db"
+	"todo-app/internal/model"
+)
+
+type Store struct{}
+
+func New() *Store { return &Store{} }
+
+func (s *Store) ListTodos(userID uint) []model.Todo {
+	var todos []model.Todo
+	db.DB.Where("user_id = ?", userID).Order("id desc").Find(&todos)
+	return todos
+}
+
+func (s *Store) CreateTodo(userID uint, title string) model.Todo {
+	t := model.Todo{UserID: userID, Title: title}
+	db.DB.Create(&t)
+	return t
+}
+
+func (s *Store) ToggleTodo(userID, id uint) (model.Todo, bool) {
+	var t model.Todo
+	if err := db.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
+		return model.Todo{}, false
+	}
+	t.Done = !t.Done
+	db.DB.Save(&t)
+	return t, true
+}
+
+func (s *Store) DeleteTodo(userID, id uint) bool {
+	res := db.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Todo{})
+	return res.RowsAffected > 0
+}
+
+// ---------- 用户 ----------
+
+func (s *Store) CreateUser(username, hashedPassword string) (model.User, error) {
+	u := model.User{Username: username, Password: hashedPassword}
+	err := db.DB.Create(&u).Error
+	return u, err
+}
+
+func (s *Store) FindUserByUsername(username string) (model.User, bool) {
+	var u model.User
+	if err := db.DB.Where("username = ?", username).First(&u).Error; err != nil {
+		return model.User{}, false
+	}
+	return u, true
+}
+```
+
+### 4. 更新 go.mod
+```
+module todo-app
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v1.10.0
+	github.com/golang-jwt/jwt/v5 v5.2.0
+	golang.org/x/crypto v0.24.0
+	gorm.io/driver/postgres v1.5.9
+	gorm.io/gorm v1.25.10
+)
+```
+
+---
+
+## 二、JWT 认证
+
+### 1. 认证工具
+
+**backend/internal/auth/auth.go**
+```go
+package auth
+
+import (
+	"errors"
+	"os"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var secret = []byte(env("JWT_SECRET", "change-me-in-prod"))
+
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+// 密码哈希
+func HashPassword(pw string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	return string(b), err
+}
+
+func CheckPassword(hash, pw string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
+}
+
+// 生成 JWT
+func GenerateToken(userID uint, username string) (string, error) {
+	claims := jwt.MapClaims{
+		"uid":      userID,
+		"username": username,
+		"exp":      time.Now().Add(72 * time.Hour).Unix(),
+		"iat":      time.Now().Unix(),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
+}
+
+// 解析 JWT
+func ParseToken(tokenStr string) (uint, string, error) {
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("签名方法错误")
+		}
+		return secret, nil
+	})
+	if err != nil || !token.Valid {
+		return 0, "", errors.New("无效 token")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return 0, "", errors.New("无效 claims")
+	}
+	uid := uint(claims["uid"].(float64))
+	username, _ := claims["username"].(string)
+	return uid, username, nil
+}
+```
+
+### 2. JWT 中间件
+
+**backend/internal/middleware/auth.go**
+```go
+package middleware
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/auth"
+)
+
+func JWTAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
+			return
+		}
+		tokenStr := strings.TrimPrefix(header, "Bearer ")
+		uid, username, err := auth.ParseToken(tokenStr)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			return
+		}
+		c.Set("uid", uid)
+		c.Set("username", username)
+		c.Next()
+	}
+}
+```
+
+### 3. 认证 Handler
+
+**backend/internal/handler/auth.go**
+```go
+package handler
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/auth"
+	"todo-app/internal/store"
+)
+
+type AuthHandler struct {
+	store *store.Store
+}
+
+func NewAuthHandler(s *store.Store) *AuthHandler {
+	return &AuthHandler{store: s}
+}
+
+func (h *AuthHandler) Register(r *gin.Engine) {
+	g := r.Group("/api/auth")
+	g.POST("/register", h.RegisterUser)
+	g.POST("/login", h.Login)
+}
+
+type credentials struct {
+	Username string `json:"username" binding:"required,min=3"`
+	Password string `json:"password" binding:"required,min=6"`
+}
+
+func (h *AuthHandler) RegisterUser(c *gin.Context) {
+	var body credentials
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	hash, _ := auth.HashPassword(body.Password)
+	u, err := h.store.CreateUser(body.Username, hash)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "用户名已存在"})
+		return
+	}
+
+	token, _ := auth.GenerateToken(u.ID, u.Username)
+	c.JSON(http.StatusCreated, gin.H{"token": token, "user": u})
+}
+
+func (h *AuthHandler) Login(c *gin.Context) {
+	var body credentials
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	u, ok := h.store.FindUserByUsername(body.Username)
+	if !ok || !auth.CheckPassword(u.Password, body.Password) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
+		return
+	}
+
+	token, _ := auth.GenerateToken(u.ID, u.Username)
+	c.JSON(http.StatusOK, gin.H{"token": token, "user": u})
+}
+```
+
+### 4. 改造 Todo Handler（加用户隔离）
+
+**backend/internal/handler/todo.go**
+```go
+package handler
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/store"
+)
+
+type TodoHandler struct {
+	store *store.Store
+}
+
+func NewTodoHandler(s *store.Store) *TodoHandler {
+	return &TodoHandler{store: s}
+}
+
+func (h *TodoHandler) Register(r *gin.Engine) {
+	g := r.Group("/api/todos")
+	g.GET("", h.List)
+	g.POST("", h.Create)
+	g.PATCH("/:id/toggle", h.Toggle)
+	g.DELETE("/:id", h.Delete)
+}
+
+func (h *TodoHandler) List(c *gin.Context) {
+	uid := c.GetUint("uid")
+	c.JSON(http.StatusOK, h.store.ListTodos(uid))
+}
+
+func (h *TodoHandler) Create(c *gin.Context) {
+	uid := c.GetUint("uid")
+	var body struct {
+		Title string `json:"title" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, h.store.CreateTodo(uid, body.Title))
+}
+
+func (h *TodoHandler) Toggle(c *gin.Context) {
+	uid := c.GetUint("uid")
+	id, _ := strconv.Atoi(c.Param("id"))
+	t, ok := h.store.ToggleTodo(uid, uint(id))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, t)
+}
+
+func (h *TodoHandler) Delete(c *gin.Context) {
+	uid := c.GetUint("uid")
+	id, _ := strconv.Atoi(c.Param("id"))
+	if !h.store.DeleteTodo(uid, uint(id)) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+```
+
+### 5. 更新 main.go
+
+**backend/cmd/server/main.go**
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/db"
+	"todo-app/internal/handler"
+	"todo-app/internal/middleware"
+	"todo-app/internal/store"
+)
+
+func main() {
+	db.Init()
+
+	r := gin.Default()
+
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	s := store.New()
+
+	// 公开接口
+	handler.NewAuthHandler(s).Register(r)
+
+	// 需要认证的接口
+	auth := r.Group("/api")
+	auth.Use(middleware.JWTAuth())
+	handler.NewTodoHandler(s).Register(auth)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	r.Run(":" + port)
+}
+```
+
+---
+
+## 三、Vue 端适配
+
+### 1. 请求拦截器
+
+**web/src/api/http.ts**
+```ts
+import axios from 'axios'
+
+const http = axios.create({ baseURL: '/api' })
+
+// 请求带上 token
+http.interceptors.request.use(config => {
+  const token = localStorage.getItem('token')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// 401 自动跳登录
+http.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('token')
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+
+export default http
+```
+
+### 2. 认证 API
+
+**web/src/api/auth.ts**
+```ts
+import http from './http'
+
+export const authApi = {
+  login: (username: string, password: string) =>
+    http.post('/auth/login', { username, password }).then(r => r.data),
+  register: (username: string, password: string) =>
+    http.post('/auth/register', { username, password }).then(r => r.data),
+}
+```
+
+### 3. 更新 todo API 用 http
+
+**web/src/api/todo.ts**
+```ts
+import http from './http'
+
+export interface Todo {
+  id: number
+  title: string
+  done: boolean
+}
+
+export const todoApi = {
+  list: () => http.get<Todo[]>('/todos').then(r => r.data),
+  create: (title: string) => http.post<Todo>('/todos', { title }).then(r => r.data),
+  toggle: (id: number) => http.patch<Todo>(`/todos/${id}/toggle`).then(r => r.data),
+  remove: (id: number) => http.delete(`/todos/${id}`),
+}
+```
+
+### 4. 登录页
+
+**web/src/views/Login.vue**
+```vue
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { authApi } from '../api/auth'
+
+const router = useRouter()
+const username = ref('')
+const password = ref('')
+const isRegister = ref(false)
+const error = ref('')
+
+async function submit() {
+  error.value = ''
+  try {
+    const fn = isRegister.value ? authApi.register : authApi.login
+    const data = await fn(username.value, password.value)
+    localStorage.setItem('token', data.token)
+    router.push('/')
+  } catch (e: any) {
+    error.value = e.response?.data?.error || '操作失败'
+  }
+}
+</script>
+
+<template>
+  <div class="login">
+    <h1>{{ isRegister ? '注册' : '登录' }}</h1>
+    <input v-model="username" placeholder="用户名（至少3位）" />
+    <input v-model="password" type="password" placeholder="密码（至少6位）" />
+    <button @click="submit">{{ isRegister ? '注册' : '登录' }}</button>
+    <p class="switch" @click="isRegister = !isRegister">
+      {{ isRegister ? '已有账号？去登录' : '没有账号？去注册' }}
+    </p>
+    <p v-if="error" class="error">{{ error }}</p>
+  </div>
+</template>
+
+<style scoped>
+.login { max-width: 320px; margin: 100px auto; display: flex; flex-direction: column; gap: 12px; }
+input { padding: 10px; font-size: 14px; }
+button { padding: 10px; cursor: pointer; }
+.switch { color: #42b883; cursor: pointer; text-align: center; font-size: 14px; }
+.error { color: red; font-size: 14px; }
+</style>
+```
+
+### 5. 路由（含守卫）
+
+**web/src/router/index.ts**
+```ts
+import { createRouter, createWebHistory } from 'vue-router'
+import TodoView from '../views/TodoView.vue'
+import Login from '../views/Login.vue'
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/login', component: Login },
+    { path: '/', component: TodoView, meta: { requiresAuth: true } },
+  ],
+})
+
+router.beforeEach((to) => {
+  if (to.meta.requiresAuth && !localStorage.getItem('token')) {
+    return '/login'
+  }
+})
+
+export default router
+```
+
+### 6. 退出登录（TodoView 里加）
+
+```vue
+<script setup lang="ts">
+import { useRouter } from 'vue-router'
+const router = useRouter()
+
+function logout() {
+  localStorage.removeItem('token')
+  router.push('/login')
+}
+</script>
+
+<template>
+  <!-- 顶部加个退出按钮 -->
+  <button @click="logout">退出登录</button>
+</template>
+```
+
+### 7. 安装依赖
+```bash
+cd web
+npm install vue-router axios pinia
+```
+
+更新 main.ts：
+```ts
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import router from './router'
+import App from './App.vue'
+
+createApp(App).use(createPinia()).use(router).mount('#app')
+```
+
+---
+
+## 四、Flutter 端适配
+
+### 1. 本地保存 token
+
+**app/pubspec.yaml** 加：
+```yaml
+dependencies:
+  dio: ^5.4.0
+  shared_preferences: ^2.2.0
+```
+
+### 2. API 加 token 拦截
+
+**app/lib/api/api.dart**
+```dart
+import 'package:dio/dio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:io' show Platform;
+import '../models/todo.dart';
+
+class Api {
+  static String get baseUrl {
+    if (Platform.isAndroid) return 'http://10.0.2.2:8080/api';
+    return 'http://localhost:8080/api';
+  }
+
+  final _dio = Dio(BaseOptions(baseUrl: baseUrl));
+
+  Api() {
+    // 请求自动带 token
+    _dio.interceptors.add(InterceptorsWrapper(
+      onRequest: (options, handler) async {
+        final prefs = await SharedPreferences.getInstance();
+        final token = prefs.getString('token');
+        if (token != null) {
+          options.headers['Authorization'] = 'Bearer $token';
+        }
+        handler.next(options);
+      },
+    ));
+  }
+
+  // ---------- 认证 ----------
+  Future<void> login(String username, String password) async {
+    final res = await _dio.post('/auth/login',
+        data: {'username': username, 'password': password});
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('token', res.data['token']);
+  }
+
+  Future<void> register(String username, String password) async {
+    final res = await _dio.post('/auth/register',
+        data: {'username': username, 'password': password});
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('token', res.data['token']);
+  }
+
+  Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('token');
+  }
+
+  Future<bool> isLoggedIn() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString('token') != null;
+  }
+
+  // ---------- 待办 ----------
+  Future<List<Todo>> list() async {
+    final res = await _dio.get('/todos');
+    return (res.data as List).map((e) => Todo.fromJson(e)).toList();
+  }
+
+  Future<Todo> create(String title) async {
+    final res = await _dio.post('/todos', data: {'title': title});
+    return Todo.fromJson(res.data);
+  }
+
+  Future<Todo> toggle(int id) async {
+    final res = await _dio.patch('/todos/$id/toggle');
+    return Todo.fromJson(res.data);
+  }
+
+  Future<void> remove(int id) => _dio.delete('/todos/$id');
+}
+```
+
+### 3. 登录页
+
+**app/lib/pages/login_page.dart**
+```dart
+import 'package:flutter/material.dart';
+import '../api/api.dart';
+import 'todo_page.dart';
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final _api = Api();
+  final _username = TextEditingController();
+  final _password = TextEditingController();
+  bool _isRegister = false;
+  String _error = '';
+
+  Future<void> _submit() async {
+    setState(() => _error = '');
+    try {
+      if (_isRegister) {
+        await _api.register(_username.text, _password.text);
+      } else {
+        await _api.login(_username.text, _password.text);
+      }
+      if (mounted) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const TodoPage()),
+        );
+      }
+    } catch (e) {
+      setState(() => _error = '操作失败，请检查输入');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(_isRegister ? '注册' : '登录',
+                style: const TextStyle(fontSize: 28)),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _username,
+              decoration: const InputDecoration(labelText: '用户名'),
+            ),
+            TextField(
+              controller: _password,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: '密码'),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton(
+              onPressed: _submit,
+              child: Text(_isRegister ? '注册' : '登录'),
+            ),
+            TextButton(
+              onPressed: () => setState(() => _isRegister = !_isRegister),
+              child: Text(_isRegister ? '已有账号？去登录' : '没有账号？去注册'),
+            ),
+            if (_error.isNotEmpty)
+              Text(_error, style: const TextStyle(color: Colors.red)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+```
+
+### 4. 更新 main.dart（入口判断登录）
+
+**app/lib/main.dart**
+```dart
+import 'package:flutter/material.dart';
+import 'api/api.dart';
+import 'pages/login_page.dart';
+import 'pages/todo_page.dart';
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Todo',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: FutureBuilder<bool>(
+        future: Api().isLoggedIn(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Scaffold(
+              body: Center(child: CircularProgressIndicator()),
+            );
+          }
+          return snapshot.data! ? const TodoPage() : const LoginPage();
+        },
+      ),
+    );
+  }
+}
+```
+
+### 5. TodoPage 加退出按钮
+
+在 `TodoPage` 的 AppBar 加：
+```dart
+appBar: AppBar(
+  title: const Text('待办事项'),
+  actions: [
+    IconButton(
+      icon: const Icon(Icons.logout),
+      onPressed: () async {
+        await Api().logout();
+        if (mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const LoginPage()),
+          );
+        }
+      },
+    ),
+  ],
+),
+```
+
+---
+
+## 五、Docker Compose（加 PostgreSQL）
+
+**docker-compose.yml**
+```yaml
+version: "3.8"
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - web_dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    networks: [appnet]
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      - PORT=8080
+      - DB_HOST=postgres
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=todo
+      - JWT_SECRET=${JWT_SECRET:-change-me}
+    depends_on:
+      - postgres
+    networks: [appnet]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: todo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [appnet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  web-builder:
+    build: ./web
+    volumes:
+      - web_dist:/output
+    networks: [appnet]
+
+volumes:
+  pgdata:
+  web_dist:
+
+networks:
+  appnet:
+```
+
+**关键点**：
+- `DB_HOST=postgres` 用容器名，走 Docker 网络
+- `healthcheck` 确保 postgres 就绪，配合后端重试
+- 数据持久化在 `pgdata` 卷
+- 密码、JWT 密钥从 `.env` 读，不硬编码
+
+**.env**（本地，别提交）
+```
+DB_PASSWORD=your-strong-password
+JWT_SECRET=your-random-secret
+```
+
+---
+
+## 六、CI/CD 流水线
+
+**.github/workflows/ci-cd.yml**
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  # ---------- 后端：测试 + 构建 ----------
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: todo_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: 下载依赖
+        working-directory: ./backend
+        run: go mod download
+
+      - name: 静态检查
+        working-directory: ./backend
+        run: go vet ./...
+
+      - name: 测试
+        working-directory: ./backend
+        env:
+          DB_HOST: localhost
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: todo_test
+        run: go test ./...
+
+      - name: 构建
+        working-directory: ./backend
+        run: go build -o /dev/null ./cmd/server
+
+  # ---------- 前端：构建 ----------
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装依赖
+        working-directory: ./web
+        run: npm ci
+      - name: 构建
+        working-directory: ./web
+        run: npm run build
+
+  # ---------- 构建并推送镜像 ----------
+  docker:
+    needs: [backend, web]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 登录镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送后端
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:${{ github.sha }}
+
+      - name: 构建并推送 Web
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/web:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/web:${{ github.sha }}
+
+  # ---------- 部署 ----------
+  deploy:
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/todo-app
+            docker compose pull
+            docker compose up -d
+            docker image prune -f
+```
+
+**流程**：push → 后端测试 → 前端构建 → 打镜像推仓库 → SSH 部署。
+
+需要配置的 Secrets：
+| Secret | 说明 |
+|---|---|
+| `SERVER_HOST` | 服务器 IP |
+| `SERVER_USER` | SSH 用户 |
+| `SERVER_SSH_KEY` | SSH 私钥 |
+| `GITHUB_TOKEN` | 自动提供 |
+
+---
+
+## 七、完整启动
+
+### 生产（一条命令）
+```bash
+cd todo-app
+cp .env.example .env      # 改密码和密钥
+docker compose up -d --build
+```
+访问 `http://localhost`：
+1. 注册账号
+2. 登录
+3. 增删改待办
+
+### 开发
+```bash
+# 基础设施
+docker compose up -d postgres
+
+# 后端
+cd backend && go run ./cmd/server
+
+# Vue
+cd web && npm run dev
+
+# Flutter
+cd app && flutter run
+```
+
+---
+
+## 八、验证接口
+
+```bash
+# 注册
+curl -X POST http://localhost/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"123456"}'
+# 返回 { "token": "eyJ..." }
+
+# 带 token 访问
+TOKEN="eyJ..."
+curl http://localhost/api/todos -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost/api/todos \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"学习 JWT"}'
+```
+
+---
+
+## 九、整体架构（最终版）
+
+```
+Flutter (iOS/Android/Win) ┐
+                          ├─→ Nginx → Go (JWT鉴权) → PostgreSQL
+Vue (Web) ────────────────┘
+                             ↑
+                        Docker Compose 编排
+                             ↑
+                        GitHub Actions CI/CD
+```
+
+| 层 | 技术 | 能力 |
+|---|---|---|
+| 客户端 | Flutter + Vue | 多端 + Web |
+| 入口 | Nginx | 反代、HTTPS、静态托管 |
+| 后端 | Go + Gin | API、JWT 认证 |
+| 数据 | PostgreSQL | 持久化、用户隔离 |
+| 编排 | Docker Compose | 一键部署 |
+| CI/CD | GitHub Actions | 测试、构建、推送、部署 |
+
+---
+
+## 十、一句话总结
+
+> **加上 PostgreSQL + JWT + CI/CD 后，这套栈从"能跑的 demo"变成"可上线的生产项目"：**
+> **数据库持久化用户和待办，JWT 实现注册登录和接口鉴权（用户数据隔离），CI/CD 自动化测试、构建镜像、推送仓库、SSH 部署。**
+> **所有服务仍由 Docker Compose 编排，Nginx 统一入口，一条命令启动，一次 push 自动上线。**
+
+需要我把这套**完整代码整理成可直接 clone 运行的文件清单**，或者继续加 **Redis 缓存 / 刷新 token / 单元测试**吗？

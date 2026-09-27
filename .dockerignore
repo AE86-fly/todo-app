@@ -1,0 +1,38 @@
+# 前端镜像的构建上下文是【项目根目录】（因为 web/Dockerfile 要 COPY
+# nginx/nginx.conf），所以这份文件管的是根目录里哪些东西不该进那个上下文。
+# 后端另有一份 backend/.dockerignore —— 它的上下文是 ./backend。
+
+# git 历史和 CI 配置，构建用不到
+.git
+.github
+
+# 环境变量文件里有数据库密码和 JWT 密钥，绝不能进镜像上下文。
+# 后端镜像只 COPY 自己的目录，本来也带不进去，这里显式写上，
+# 免得以后有人改了 COPY 路径就顺手漏出去了。
+.env
+.env.*
+
+# 前端依赖和构建产物：node 镜像里 npm ci 会自己装一份。
+# 宿主机的 node_modules 是另一个平台装的，混进上下文会让构建
+# 失败或者产出诡异的结果；几万个小文件还会让每次 docker build 慢得离谱。
+web/node_modules
+web/dist
+
+# Flutter 产物。app/build/web 有几十 MB、上万个文件，
+# 进了构建上下文会让 docker build 变得非常慢。
+# 它是运行时通过 volume 挂给 nginx 的，不需要进镜像。
+app/build
+app/.dart_tool
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+
+# 后端有自己的构建上下文，前端镜像用不到它的源码
+backend
+
+# 容器里用不到的开发辅助文件
+compose.yaml
+Makefile
+README.md
+scripts
+1.txt
+2.txt

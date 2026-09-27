@@ -1,0 +1,27 @@
+name: todo_app
+description: todo-app 的 Flutter 客户端
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # dio 而不是 http：需要请求/响应拦截器来统一挂 token、统一处理 401，
+  # http 包要自己在每个调用点包一层。
+  dio: ^5.7.0
+
+  # token 的本地存储。web 上它就是 localStorage，
+  # 移动和桌面端走平台原生的键值存储。
+  shared_preferences: ^2.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,808 @@
+# 完整项目实战：Go + Vue + Flutter + Docker
+
+下面给一个**能跑起来的最小完整项目**：一个"待办事项"应用，覆盖你整套技术栈。
+
+---
+
+## 一、项目结构
+
+```
+todo-app/
+├── backend/                 # Go 后端
+│   ├── cmd/server/main.go
+│   ├── internal/
+│   │   ├── handler/todo.go
+│   │   ├── model/todo.go
+│   │   └── store/store.go
+│   ├── go.mod
+│   └── Dockerfile
+│
+├── web/                     # Vue 前端
+│   ├── src/
+│   │   ├── main.ts
+│   │   ├── App.vue
+│   │   ├── api/todo.ts
+│   │   └── stores/todo.ts
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── Dockerfile
+│
+├── app/                     # Flutter 客户端
+│   ├── lib/
+│   │   ├── main.dart
+│   │   ├── api/api.dart
+│   │   ├── models/todo.dart
+│   │   └── pages/todo_page.dart
+│   └── pubspec.yaml
+│
+├── nginx/
+│   └── nginx.conf
+├── docker-compose.yml
+└── README.md
+```
+
+---
+
+## 二、Go 后端
+
+### backend/go.mod
+```
+module todo-app
+
+go 1.22
+
+require github.com/gin-gonic/gin v1.10.0
+```
+
+### backend/internal/model/todo.go
+```go
+package model
+
+type Todo struct {
+	ID    int    `json:"id"`
+	Title string `json:"title" binding:"required"`
+	Done  bool   `json:"done"`
+}
+```
+
+### backend/internal/store/store.go
+```go
+package store
+
+import (
+	"sync"
+	"todo-app/internal/model"
+)
+
+type Store struct {
+	mu     sync.RWMutex
+	todos  map[int]model.Todo
+	nextID int
+}
+
+func New() *Store {
+	return &Store{todos: make(map[int]model.Todo), nextID: 1}
+}
+
+func (s *Store) List() []model.Todo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]model.Todo, 0, len(s.todos))
+	for _, t := range s.todos {
+		list = append(list, t)
+	}
+	return list
+}
+
+func (s *Store) Create(title string) model.Todo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := model.Todo{ID: s.nextID, Title: title, Done: false}
+	s.todos[s.nextID] = t
+	s.nextID++
+	return t
+}
+
+func (s *Store) Toggle(id int) (model.Todo, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.todos[id]
+	if !ok {
+		return model.Todo{}, false
+	}
+	t.Done = !t.Done
+	s.todos[id] = t
+	return t, true
+}
+
+func (s *Store) Delete(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.todos[id]; !ok {
+		return false
+	}
+	delete(s.todos, id)
+	return true
+}
+```
+
+### backend/internal/handler/todo.go
+```go
+package handler
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/model"
+	"todo-app/internal/store"
+)
+
+type TodoHandler struct {
+	store *store.Store
+}
+
+func NewTodoHandler(s *store.Store) *TodoHandler {
+	return &TodoHandler{store: s}
+}
+
+func (h *TodoHandler) Register(r *gin.Engine) {
+	g := r.Group("/api/todos")
+	g.GET("", h.List)
+	g.POST("", h.Create)
+	g.PATCH("/:id/toggle", h.Toggle)
+	g.DELETE("/:id", h.Delete)
+}
+
+func (h *TodoHandler) List(c *gin.Context) {
+	c.JSON(http.StatusOK, h.store.List())
+}
+
+func (h *TodoHandler) Create(c *gin.Context) {
+	var body struct {
+		Title string `json:"title" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, h.store.Create(body.Title))
+}
+
+func (h *TodoHandler) Toggle(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	t, ok := h.store.Toggle(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, t)
+}
+
+func (h *TodoHandler) Delete(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	if !h.store.Delete(id) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+```
+
+### backend/cmd/server/main.go
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"todo-app/internal/handler"
+	"todo-app/internal/store"
+)
+
+func main() {
+	r := gin.Default()
+
+	// 健康检查
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	s := store.New()
+	handler.NewTodoHandler(s).Register(r)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	r.Run(":" + port)
+}
+```
+
+### backend/Dockerfile
+```dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/server
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+COPY --from=builder /app/server .
+EXPOSE 8080
+CMD ["./server"]
+```
+
+---
+
+## 三、Vue 前端
+
+### web/package.json
+```json
+{
+  "name": "todo-web",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "pinia": "^2.2.0",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.0",
+    "vite": "^5.4.0"
+  }
+}
+```
+
+### web/vite.config.ts
+```ts
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    proxy: {
+      '/api': 'http://localhost:8080'   // 开发时代理到后端
+    }
+  }
+})
+```
+
+### web/src/api/todo.ts
+```ts
+import axios from 'axios'
+
+const api = axios.create({ baseURL: '/api' })
+
+export interface Todo {
+  id: number
+  title: string
+  done: boolean
+}
+
+export const todoApi = {
+  list: () => api.get<Todo[]>('/todos').then(r => r.data),
+  create: (title: string) => api.post<Todo>('/todos', { title }).then(r => r.data),
+  toggle: (id: number) => api.patch<Todo>(`/todos/${id}/toggle`).then(r => r.data),
+  remove: (id: number) => api.delete(`/todos/${id}`),
+}
+```
+
+### web/src/stores/todo.ts
+```ts
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import { todoApi, type Todo } from '../api/todo'
+
+export const useTodoStore = defineStore('todo', () => {
+  const todos = ref<Todo[]>([])
+  const loading = ref(false)
+
+  async function fetch() {
+    loading.value = true
+    todos.value = await todoApi.list()
+    loading.value = false
+  }
+
+  async function add(title: string) {
+    if (!title.trim()) return
+    todos.value.push(await todoApi.create(title))
+  }
+
+  async function toggle(id: number) {
+    const t = await todoApi.toggle(id)
+    const i = todos.value.findIndex(x => x.id === id)
+    if (i >= 0) todos.value[i] = t
+  }
+
+  async function remove(id: number) {
+    await todoApi.remove(id)
+    todos.value = todos.value.filter(t => t.id !== id)
+  }
+
+  return { todos, loading, fetch, add, toggle, remove }
+})
+```
+
+### web/src/App.vue
+```vue
+<script setup lang="ts">
+import { ref, onMounted } from 'vue'
+import { useTodoStore } from './stores/todo'
+
+const store = useTodoStore()
+const input = ref('')
+
+onMounted(() => store.fetch())
+
+async function submit() {
+  await store.add(input.value)
+  input.value = ''
+}
+</script>
+
+<template>
+  <div class="app">
+    <h1>待办事项</h1>
+    <div class="input-row">
+      <input v-model="input" @keyup.enter="submit" placeholder="输入待办..." />
+      <button @click="submit">添加</button>
+    </div>
+    <ul>
+      <li v-for="t in store.todos" :key="t.id">
+        <input type="checkbox" :checked="t.done" @change="store.toggle(t.id)" />
+        <span :class="{ done: t.done }">{{ t.title }}</span>
+        <button @click="store.remove(t.id)">删除</button>
+      </li>
+    </ul>
+    <p v-if="store.loading">加载中...</p>
+  </div>
+</template>
+
+<style scoped>
+.app { max-width: 500px; margin: 40px auto; font-family: sans-serif; }
+.input-row { display: flex; gap: 8px; margin-bottom: 16px; }
+.input-row input { flex: 1; padding: 8px; }
+ul { list-style: none; padding: 0; }
+li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #eee; }
+li span { flex: 1; }
+.done { text-decoration: line-through; color: #999; }
+</style>
+```
+
+### web/src/main.ts
+```ts
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import App from './App.vue'
+
+createApp(App).use(createPinia()).mount('#app')
+```
+
+### web/index.html
+```html
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>待办事项</title>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+```
+
+### web/Dockerfile
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+CMD ["sh", "-c", "cp -r /app/dist/* /output/"]
+```
+
+---
+
+## 四、Flutter 客户端
+
+### app/pubspec.yaml
+```yaml
+name: todo_app
+description: Todo client
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+```
+
+### app/lib/models/todo.dart
+```dart
+class Todo {
+  final int id;
+  final String title;
+  final bool done;
+
+  Todo({required this.id, required this.title, required this.done});
+
+  factory Todo.fromJson(Map<String, dynamic> json) => Todo(
+        id: json['id'] as int,
+        title: json['title'] as String,
+        done: json['done'] as bool,
+      );
+}
+```
+
+### app/lib/api/api.dart
+```dart
+import 'package:dio/dio.dart';
+import 'dart:io' show Platform;
+import '../models/todo.dart';
+
+class Api {
+  // Android 模拟器访问宿主机用 10.0.2.2，其余用 localhost
+  static String get baseUrl {
+    if (Platform.isAndroid) return 'http://10.0.2.2:8080/api';
+    return 'http://localhost:8080/api';
+  }
+
+  final _dio = Dio(BaseOptions(baseUrl: baseUrl));
+
+  Future<List<Todo>> list() async {
+    final res = await _dio.get('/todos');
+    return (res.data as List).map((e) => Todo.fromJson(e)).toList();
+  }
+
+  Future<Todo> create(String title) async {
+    final res = await _dio.post('/todos', data: {'title': title});
+    return Todo.fromJson(res.data);
+  }
+
+  Future<Todo> toggle(int id) async {
+    final res = await _dio.patch('/todos/$id/toggle');
+    return Todo.fromJson(res.data);
+  }
+
+  Future<void> remove(int id) => _dio.delete('/todos/$id');
+}
+```
+
+### app/lib/pages/todo_page.dart
+```dart
+import 'package:flutter/material.dart';
+import '../api/api.dart';
+import '../models/todo.dart';
+
+class TodoPage extends StatefulWidget {
+  const TodoPage({super.key});
+
+  @override
+  State<TodoPage> createState() => _TodoPageState();
+}
+
+class _TodoPageState extends State<TodoPage> {
+  final _api = Api();
+  final _controller = TextEditingController();
+  List<Todo> _todos = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    _todos = await _api.list();
+    setState(() => _loading = false);
+  }
+
+  Future<void> _add() async {
+    final title = _controller.text.trim();
+    if (title.isEmpty) return;
+    final t = await _api.create(title);
+    setState(() => _todos.add(t));
+    _controller.clear();
+  }
+
+  Future<void> _toggle(int id) async {
+    final t = await _api.toggle(id);
+    setState(() {
+      final i = _todos.indexWhere((x) => x.id == id);
+      if (i >= 0) _todos[i] = t;
+    });
+  }
+
+  Future<void> _remove(int id) async {
+    await _api.remove(id);
+    setState(() => _todos.removeWhere((t) => t.id == id));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('待办事项')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    decoration: const InputDecoration(hintText: '输入待办...'),
+                    onSubmitted: (_) => _add(),
+                  ),
+                ),
+                IconButton(icon: const Icon(Icons.add), onPressed: _add),
+              ],
+            ),
+            Expanded(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : ListView.builder(
+                      itemCount: _todos.length,
+                      itemBuilder: (_, i) {
+                        final t = _todos[i];
+                        return ListTile(
+                          leading: Checkbox(
+                            value: t.done,
+                            onChanged: (_) => _toggle(t.id),
+                          ),
+                          title: Text(
+                            t.title,
+                            style: TextStyle(
+                              decoration: t.done
+                                  ? TextDecoration.lineThrough
+                                  : null,
+                            ),
+                          ),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete),
+                            onPressed: () => _remove(t.id),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+```
+
+### app/lib/main.dart
+```dart
+import 'package:flutter/material.dart';
+import 'pages/todo_page.dart';
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Todo',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const TodoPage(),
+    );
+  }
+}
+```
+
+---
+
+## 五、Nginx 配置
+
+### nginx/nginx.conf
+```nginx
+events { worker_connections 1024; }
+
+http {
+    include /etc/nginx/mime.types;
+
+    server {
+        listen 80;
+        server_name _;
+
+        # Vue 静态文件
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri $uri/ /index.html;
+        }
+
+        # 后端 API
+        location /api/ {
+            proxy_pass http://backend:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # 健康检查
+        location /health {
+            proxy_pass http://backend:8080/health;
+        }
+    }
+}
+```
+
+---
+
+## 六、Docker Compose 编排
+
+### docker-compose.yml
+```yaml
+version: "3.8"
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - web_dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    networks: [appnet]
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      - PORT=8080
+    networks: [appnet]
+    restart: unless-stopped
+
+  web-builder:
+    build: ./web
+    volumes:
+      - web_dist:/output
+    networks: [appnet]
+
+volumes:
+  web_dist:
+
+networks:
+  appnet:
+```
+
+**设计要点**：
+- 只有 nginx 暴露 80，后端不占宿主端口 → **不会端口冲突**
+- nginx 用容器名 `backend` 转发
+- Vue 构建产物通过 `web_dist` 卷交给 nginx
+
+---
+
+## 七、启动步骤
+
+### 1. 启动后端 + Web + Nginx
+```bash
+cd todo-app
+docker compose up -d --build
+```
+访问 `http://localhost` 即可看到 Vue 页面，API 走 `/api`。
+
+### 2. 单独开发后端（热重载）
+```bash
+cd backend
+go run ./cmd/server
+```
+
+### 3. 单独开发 Vue（热更新）
+```bash
+cd web
+npm install
+npm run dev          # http://localhost:5173，代理到 8080
+```
+
+### 4. 运行 Flutter
+```bash
+cd app
+flutter pub get
+flutter run          # 选择设备：Windows / Android / iOS
+```
+
+**注意**：Flutter 在 Android 模拟器访问宿主机要用 `10.0.2.2`（代码里已处理）。
+
+### 5. 打各端包
+```bash
+cd app
+flutter build apk          # Android
+flutter build ios          # iOS（需 Mac）
+flutter build windows      # Windows 桌面
+```
+
+---
+
+## 八、开发工作流
+
+| 场景 | 命令 |
+|---|---|
+| 全栈一键起 | `docker compose up -d --build` |
+| 只改后端 | `cd backend && go run ./cmd/server` |
+| 只改 Vue | `cd web && npm run dev` |
+| 只改 Flutter | `cd app && flutter run` |
+| 改完重新部署 | `docker compose up -d --build` |
+
+**VSCode 一个窗口打开 `todo-app/`，前后端一起改。**
+
+---
+
+## 九、验证
+
+```bash
+# 后端接口
+curl http://localhost/api/todos
+curl -X POST http://localhost/api/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title":"学习 Docker"}'
+
+# 健康检查
+curl http://localhost/health
+```
+
+Vue 页面和 Flutter 应用都能看到同一个待办列表——**一套后端，多端共享**。
+
+---
+
+## 十、下一步可以扩展
+
+| 方向 | 怎么做 |
+|---|---|
+| 持久化 | 接入 PostgreSQL，替换内存 store |
+| 缓存 | 加 Redis |
+| 认证 | JWT + 中间件 |
+| 接口文档 | Go 用 swag 生成 Swagger |
+| HTTPS | Nginx 配证书 |
+| CI/CD | GitHub Actions 构建推送镜像 |
+| 生产编排 | 换 K8s |
+| 桌面打包 | Flutter Windows 出安装包 |
+
+---
+
+## 十一、一句话总结
+
+> **这套项目把 Go 后端、Vue Web、Flutter 多端、Nginx、Docker Compose 全部串起来：后端和 Web 容器化，Nginx 统一入口按容器名转发（不占宿主端口），Flutter 作为客户端直连 API。**
+> **开发时各端本地跑享受热重载，部署时一条 `docker compose up -d --build` 全搞定。**
+
+需要我接着把**数据库（PostgreSQL）接入**、**JWT 认证**或 **CI/CD 流水线**补上吗？

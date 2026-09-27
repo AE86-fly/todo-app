@@ -1,0 +1,154 @@
+# todo-app 的三个服务：postgres + Go 后端 + nginx。
+#
+# 默认起来的是「生产形态」：nginx 发编译好的静态文件，只对宿主机暴露一个端口。
+#   docker compose up -d --build      → http://localhost:8081
+#
+# 开发时想要热重载，额外把 Vite dev server 起起来：
+#   docker compose --profile dev up -d web-dev   → http://localhost:5173
+#
+# 端口全部刻意与兄弟项目 c-web 错开（它占 80 和 5432），
+# 所以两个项目可以同时跑，互不干扰。
+
+name: todo-app
+
+services:
+  db:
+    image: postgres:16
+    container_name: todo-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-todo}
+      POSTGRES_DB:       ${POSTGRES_DB:-todo}
+      # :? 表示这个变量没有值就直接报错退出。
+      # 不这么写的话，compose 会拿空字符串当密码把容器起起来 ——
+      # 一个"启动成功但谁都能连"的数据库，比启动失败危险得多。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+
+    ports:
+      # 绑回环，外网碰不到。api 走 compose 内部网络就能连上，
+      # 这个发布是留给"在宿主机直接 go run 后端"时连的。
+      #
+      # 用 5433 而不是 5432：5432 被 c-web 占着。
+      #
+      # 注意 ports 不能放进 profile —— compose 的 profile 是服务级的，
+      # 没法让同一个服务的 ports 随 profile 切换。要做到"只在开发时发布"
+      # 只能把这个服务拆成两个，代价比收益大，所以恒定发布回环端口。
+      - "127.0.0.1:5433:5432"
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    # postgres 会拿 /dev/shm 做并行查询，而容器默认只给 64MB，
+    # 稍大的查询就会报 "could not resize shared memory segment"。
+    shm_size: 128mb
+
+    healthcheck:
+      # $$ 是转义：compose 会先吃掉一层 $，不转义的话容器里拿到的是空值，
+      # 于是 pg_isready 永远失败，depends_on 的 service_healthy 永远等不到，
+      # 整个 up 就卡在那里。
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    # 同时写 image 和 build：
+    #   - 本地 docker compose up --build 走 build
+    #   - 镜像被推到 registry 之后，docker compose pull 走 image
+    # 这正是原教程 CI 断掉的地方 —— 它推了 ghcr 镜像，但 compose 里
+    # 只有 build、没有任何 image 引用，于是 deploy 端要么重新构建源码、
+    # 要么什么都拉不到。用环境变量覆盖，本地和 CI 各取所需。
+    image: ${API_IMAGE:-todo-app-api:latest}
+    build: ./backend
+    container_name: todo-api
+    restart: unless-stopped
+
+    environment:
+      PORT:        "8080"
+      DB_HOST:     db
+      DB_PORT:     "5432"
+      DB_USER:     ${POSTGRES_USER:-todo}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      DB_NAME:     ${POSTGRES_DB:-todo}
+      JWT_SECRET:  ${JWT_SECRET:?请在 .env 里设置 JWT_SECRET，例如 openssl rand -hex 32}
+
+    # 不发布端口：只有同一个 compose 网络里的 nginx 需要连它。
+    # 附带好处是宿主机上 go run ./cmd/server 占 8080 完全不冲突。
+
+    depends_on:
+      db:
+        # 光 depends_on 只保证启动顺序，不保证数据库「已经能用了」。
+        # 带 condition 才是等健康检查通过再启动。
+        condition: service_healthy
+
+    healthcheck:
+      # alpine 自带 busybox 的 wget，不用额外装 curl。
+      # 打 /readyz 而不是 /healthz：后者只说明进程活着，
+      # 前者才说明数据库也连得上，也就是"真的能接流量了"。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  web:
+    image: ${WEB_IMAGE:-todo-app-web:latest}
+    build:
+      # 上下文是项目根目录而不是 web/：nginx/nginx.conf 在根目录，
+      # 前端镜像需要把它一起 COPY 进去。
+      context: .
+      dockerfile: web/Dockerfile
+    container_name: todo-web
+    restart: unless-stopped
+
+    ports:
+      # 只有这一个端口对宿主机开放，且绑在回环上。
+      # 8081 是为了错开 c-web 的 80。
+      - "127.0.0.1:8081:80"
+
+    volumes:
+      # Flutter web 产物。挂上了才有 /app/，没挂就返回 404，
+      # 不影响 Vue 前端 —— Flutter 是可选件，不该拖累主链路。
+      - ./app/build/web:/srv/flutter/app:ro
+
+    depends_on:
+      api:
+        # 等后端真的能服务了再起 nginx，避免刚 up 完那几秒里
+        # /api 请求返回 502。
+        condition: service_healthy
+
+  # ---- 以下仅供开发，默认不启动 ----
+
+  web-dev:
+    image: node:24-alpine
+    container_name: todo-web-dev
+    profiles: ["dev"]
+    restart: unless-stopped
+    working_dir: /app
+
+    # 首次启动时装依赖，之后 node_modules 在卷里，秒起。
+    command: sh -c '[ -d node_modules/vue ] || npm install; exec npm run dev'
+
+    environment:
+      # vite.config.ts 里的代理目标。容器里用服务名即可。
+      VITE_API_TARGET: http://api:8080
+
+    volumes:
+      # 源码挂进来，改一行 .vue 立刻热重载
+      - ./web:/app
+      # 匿名卷：让 node_modules 留在容器里，别被上面那行挂载覆盖掉。
+      # 宿主机的 node_modules 可能是空的、也可能是别的平台装的。
+      - /app/node_modules
+
+    ports:
+      - "127.0.0.1:5173:5173"
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

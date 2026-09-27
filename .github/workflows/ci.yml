@@ -1,0 +1,127 @@
+# 本地等价物是 `make check` —— 覆盖的步骤完全一样：go vet / go test /
+# vue-tsc / flutter analyze / flutter test。
+#
+# 但**机制不同**，这点值得说清楚：`make check` 走的是容器里的工具链
+# （挂载编译，见 Makefile 顶部和 README），而这里用的是 runner 自带的
+# Go 和 Node（由 setup-go / setup-node 固定版本）。原因是每次 CI 都去构建
+# 两个工具链镜像纯属浪费 —— runner 本来就是一次性的、版本已经被 setup-*
+# 钉死了，不需要容器再提供一致性。
+#
+# 所以：本地绿了不代表 CI 一定绿（工具链版本可能不同），
+# 反过来也一样。两边都跑才算数。
+#
+# ⚠️ 这个文件尚未在真实 runner 上运行过。
+#    本目录当前不是 git 仓库，没有 remote，`on: push` 不可能被触发。
+#    推到 GitHub 之后它才会真正生效 —— 在那之前，请不要把它当作
+#    "CI 是通的"的证据。
+#
+# 特意没有 deploy job。原教程里那个 appleboy/ssh-action 的部署步骤需要
+# 一整套真实基础设施（服务器、SSH 私钥、registry 写权限、服务器上已有的
+# 源码或可拉的镜像），写进来只会让它"看起来完整"，实际既无法执行
+# 也无法验证。部署怎么做取决于你的实际环境，不该由模板猜。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: 下载依赖
+        working-directory: backend
+        run: go mod download
+
+      - name: 静态检查
+        working-directory: backend
+        run: go vet ./...
+
+      # -race 在 CI 里开着：本地为了快常常不带，但数据竞争
+      # 正是那种"本地跑一百次都没事、上线才出问题"的 bug。
+      - name: 单元测试
+        working-directory: backend
+        run: go test ./... -count=1 -race
+
+      - name: 构建
+        working-directory: backend
+        run: go build ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 下载依赖
+        working-directory: web
+        # npm ci 要求 package-lock.json 存在且与之严格一致。
+        # 原教程用的是 npm install，锁文件从来没被提交过 ——
+        # 所以那一版 CI 的这一步在真实 runner 上必然失败。
+        run: npm ci
+
+      - name: 类型检查
+        working-directory: web
+        run: npm run type-check
+
+      - name: 构建
+        working-directory: web
+        run: npm run build
+
+  # 端到端：把整套真正拉起来，跑 scripts/verify.sh 里的那些断言。
+  #
+  # 这一步不能省。前面两个 job 全绿，也只说明"各层自己没问题"——
+  # 接线错了（路由前缀拼重、nginx 转发的路径不对、健康检查的依赖顺序
+  # 没配）它们一个都发现不了，而这恰恰是最容易出错的地方。
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 .env
+        # 这些值只在本次 CI 运行里有效，用完即弃。
+        run: |
+          {
+            echo "POSTGRES_USER=todo"
+            echo "POSTGRES_DB=todo"
+            echo "POSTGRES_PASSWORD=ci-$(openssl rand -hex 16)"
+            echo "JWT_SECRET=$(openssl rand -hex 32)"
+          } > .env
+
+      - name: 构建并启动
+        run: docker compose up -d --build
+
+      - name: 等待服务健康
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8081/readyz >/dev/null 2>&1; then
+              echo "服务已就绪"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "等待超时，导出日志："
+          docker compose logs
+          exit 1
+
+      - name: 端到端验收
+        run: ./scripts/verify.sh
+
+      - name: 失败时导出日志
+        if: failure()
+        run: docker compose logs
