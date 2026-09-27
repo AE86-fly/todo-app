@@ -30,11 +30,15 @@
 # - **publish job 跑不了**：需要 registry 凭据（GITHUB_TOKEN），本机没有。
 #   `-l` 能证明它的结构和依赖关系合法，仅此而已。
 #
-# - **e2e job 有额外风险**：它要执行 `docker compose up -d --build`，即在容器里
-#   用 Docker。act 默认会挂宿主机的 docker socket（启动日志里的
-#   "daemon socket 'unix:///var/run/docker.sock'" 就是它），但容器里还得有
-#   docker CLI，且 compose 的端口发布、卷路径都可能在嵌套环境里行为不同。
-#   这一条单独看结论，别让它牵连另外两个 job。
+# - **e2e job 会和正在运行的栈打架**。它执行 `docker compose up -d --build`，
+#   而容器里的工作目录名恰好也叫 todo-app，于是 compose 推导出的项目名
+#   和你本地那个栈**完全相同** —— 它不是在旁边另起一套，而是直接重建你的
+#   容器、抢 8081 端口。
+#
+#   实测（2026-09-27）：三件事都成立 —— act 的 e2e job 能跑通，
+#   而且跑完之后你原来那个栈是被它重建过的（数据和卷不变）。
+#   所以跑 e2e 之前先 `docker compose down`，跑完再 `make up`，
+#   别在栈正跑着的时候跑它。
 #
 # - **GOPROXY**：workflow 里已经显式设成 goproxy.cn 了（和 backend/Dockerfile
 #   保持一致）。不设的话默认的 proxy.golang.org 在这台机器上会卡满 5 分钟

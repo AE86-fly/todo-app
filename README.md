@@ -318,4 +318,87 @@ Docker Hub 直连在这台机器上也不通，靠 daemon 配置的国内 mirror
 
 所以**本地绿了不代表 CI 一定绿**（工具链版本可能不同），反过来也一样。两边都跑才算数。
 
-**它尚未在真实 runner 上运行过**——这个目录当前不是 git 仓库，没有 remote，`on: push` 不可能被触发。等 `git init` 并推到 GitHub 之后它才会真正生效。
+### 在本机跑 CI（`./scripts/act.sh`）
+
+用 [act](https://nektosact.com/) 在本机执行 workflow：
+
+```bash
+./scripts/act.sh -l              # 列出 job
+./scripts/act.sh -j backend      # 只跑 backend
+./scripts/act.sh                 # 跑全部
+```
+
+**包装脚本解决的是这台机器特有的问题**：`github.com` 直连不通，而 act 默认会用
+`git clone` 从 github.com 拉取每一个 `uses:` 引用的 action，于是任何 workflow 都挂在第一步。
+但 `codeload.github.com` 是通的，所以脚本先从那里抓 tarball 缓存到本地，
+再用 act 的 `--local-repository` 映射过去 —— **workflow 文件一个字都不用改**。
+
+这个取舍是刻意的：改 workflow 去迁就本机，就等于验证了另一份东西。
+
+**已知限制**：
+
+- `publish` job 跑不了，需要 registry 凭据。`-l` 只能证明它的结构和依赖关系合法。
+- **`act -j e2e` 会和正在运行的栈打架**：容器里的目录名也叫 `todo-app`，compose 推导出的
+  项目名和你本地那个栈完全相同，它会直接重建你的容器、抢 8081 端口。跑之前先
+  `docker compose down`，跑完再 `make up`。
+
+### 验证结果（2026-09-27）
+
+三个能跑的 job 都真正执行过，全部通过：
+
+| job | 结果 |
+|---|---|
+| `backend` | ✅ checkout → setup-go → `go mod download` → `go vet` → `go test -race` → `go build` |
+| `web` | ✅ checkout → setup-node → `npm ci` → `vue-tsc` → `vite build` |
+| `e2e` | ✅ 起栈 → 等健康 → **35/35 断言全过** |
+| `publish` | ⚠️ 未验证（需要 registry 凭据） |
+
+**它抓到了一个真实的 bug**：`.gitignore` 里的 `server` 本意是排除本地编译出的二进制，
+但它会匹配任意层级下名为 `server` 的**目录** —— 于是 `backend/cmd/server/main.go`
+从来没进过版本控制。本地一直看不出来（文件就在磁盘上），但只要 clone 一次就会暴露：
+没有 main 包，`go build ./cmd/server` 直接失败，整个镜像构建跑不起来。
+
+这正是 e2e job 存在的意义：前面的单元测试和类型检查全绿，也发现不了"仓库根本不完整"。
+已修复（产物路径改成锚定的 `/backend/server`）。
+
+**仍未在真实 GitHub runner 上运行过** —— 这台机器没有 remote，`on: push` 不可能被触发。
+act 与真实 runner 的差异主要在：runner 镜像版本、系统工具、并发行为。
+推到 GitHub 之后才能说"CI 在真实环境上也是通的"。
+
+## CD：镜像推送与消费
+
+`publish` job 在三个测试 job 全过后，把 api / web 两个镜像推到 ghcr.io：
+
+```
+ghcr.io/<owner>/<repo>/api:sha-<commit>
+ghcr.io/<owner>/<repo>/api:latest
+ghcr.io/<owner>/<repo>/web:sha-<commit>
+ghcr.io/<owner>/<repo>/web:latest
+```
+
+两个 tag 是有意为之：`sha-<commit>` 用于精确定位和回滚，`latest` 用于"就要最新的"。
+只推 `latest` 的话，出问题想回退都找不到旧镜像。
+
+只在 `main` 的 push 上触发 —— PR 也推的话，任何人都能往 registry 里塞镜像。
+
+### 部署端怎么用
+
+`compose.yaml` 里 `api` 和 `web` 两个服务同时写了 `image:` 和 `build:`，就是为了这个：
+本地 `up --build` 走 build，部署端则用环境变量把 `image:` 指向 registry：
+
+```bash
+API_IMAGE=ghcr.io/owner/repo/api:sha-abc1234 \
+WEB_IMAGE=ghcr.io/owner/repo/web:sha-abc1234 \
+docker compose pull && docker compose up -d
+```
+
+回滚就是把 `sha-` 换成上一个 commit，重新 pull + up。
+
+**首次推送后要去仓库设置里把包的可见性改成 public**（或让部署端登录 ghcr）。
+ghcr 的包默认是 private，不登录拉不动，而报错只说 `denied`，不会提示是这个原因。
+
+### 为什么没有 deploy job
+
+推镜像只需要 GitHub 自己发的 `GITHUB_TOKEN`，不需要任何外部凭据，是真正能跑通的；
+而部署需要一整套真实基础设施（服务器、SSH 私钥、服务器上的目录），写进来只会让它
+"看起来完整"，实际既无法执行也无法验证。部署怎么做取决于你的环境，不该由模板猜。
