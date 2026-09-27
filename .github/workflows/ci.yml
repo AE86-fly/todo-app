@@ -28,6 +28,21 @@
 
 name: CI
 
+# 全局 env。
+#
+# GOPROXY：**必须**。backend/Dockerfile 里已经声明了同一个代理
+# （`ARG GOPROXY=https://goproxy.cn,direct`），CI 这边不设就是内部不一致。
+# 而且默认的 proxy.golang.org 在这台开发机上直连不通 —— 实测 go mod download
+# 会卡满 5 分钟再报 i/o timeout。goproxy.cn 在 GitHub 的 runner 上同样可达，
+# 所以两边都能跑，代价只是海外 runner 上稍慢一点。
+#
+# GOTOOLCHAIN：钉成 local，禁止 go 因为 go.mod 里的版本号去下载另一个工具链。
+# go.mod 写的是 1.27.1，setup-go 装的也是 1.27.1，本来就不会触发；
+# 但万一以后两者不同步，这个设置能让它在本地就报错，而不是悄悄下载一个。
+env:
+  GOPROXY: https://goproxy.cn,direct
+  GOTOOLCHAIN: local
+
 on:
   push:
     branches: [main]

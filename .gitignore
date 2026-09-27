@@ -5,9 +5,18 @@ node_modules/
 dist/
 app/build/
 app/.dart_tool/
-# 本地 go build 出来的二进制
-server
-bin/
+
+# 本地 go build 出来的二进制。
+#
+# 路径必须写全 —— 只写 `server` 会匹配**任意层级**下名为 server 的文件或目录，
+# 包括 backend/cmd/server/ 这个目录本身。那样 main.go 会被静默排除在版本控制
+# 之外：本地因为文件在磁盘上所以一切正常，但 clone 下来根本没有 main 包，
+# `go build ./cmd/server` 直接失败，整个镜像构建跑不起来。
+#
+# 这个坑是 CI 真跑起来之后才暴露的（act 用的是 git 的内容，不是磁盘的内容）。
+# 教训：构建产物要么锚定完整路径，要么用更精确的模式，别用裸的文件名。
+/backend/server
+/bin/
 
 # --- 密钥与环境变量 ---
 # .env 里有数据库密码和 JWT 密钥，绝不能提交。
