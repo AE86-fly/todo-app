@@ -16,16 +16,17 @@
 #    （此前这里写的是"尚未在真实 runner 上运行过"——那是当时的真实状态：
 #    仓库没有 remote，`on: push` 触发不了。推送后该结论已闭环，故更新。）
 #
-# 有 publish job（推镜像到 ghcr.io），但**仍然没有 deploy job**。
+# 有 publish job（推镜像到 ghcr.io）和 deploy job（把镜像拉到服务器上重启）。
 #
-# 区别在于：推镜像只需要 GitHub 自己发的 GITHUB_TOKEN，不需要任何外部凭据，
-# 是真正能跑通的；而原教程里那个 appleboy/ssh-action 的部署步骤需要一整套
-# 真实基础设施（服务器、SSH 私钥、服务器上的目录），写进来只会让它
-# "看起来完整"，实际既无法执行也无法验证。
+# deploy 是后来才加的，原因值得记一笔：最初刻意不写它 —— 推镜像只需要 GitHub
+# 自己发的 GITHUB_TOKEN，而部署需要一整套真实基础设施（服务器、SSH 私钥、
+# 服务器上的目录），在模板里凭空写一个既跑不了也验证不了。
+# 现在这台服务器真实存在、也确实在跑这个项目，部署这一步才第一次变得
+# 可执行、可验证 —— 不是"补全了一个看起来完整的模板"，而是有了真实的落点。
 #
-# 部署端怎么消费推出来的镜像，README 里有说明（compose 的 API_IMAGE /
-# WEB_IMAGE 两个钩子就是为此预留的）。具体怎么部署取决于你的环境，
-# 不该由模板猜。
+# 需要的 secrets：DEPLOY_SSH_KEY / DEPLOY_HOST / DEPLOY_KNOWN_HOSTS。
+# 用的是**专用部署密钥**，不是个人密钥：一旦要作废，只需从服务器上删掉
+# authorized_keys 里那一行，不影响个人身份的其它用途。
 
 name: CI
 
@@ -244,3 +245,84 @@ jobs:
             ${{ env.IMAGE_PREFIX }}/web:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # 部署：把新镜像拉到服务器上重启。
+  #
+  # needs publish —— 镜像没推成功就谈不上部署。
+  # 触发条件和 publish 一样，只在 main 的 push 上跑。
+  #
+  # 用裸 ssh 而不是 appleboy/ssh-action：少一个第三方 action，就少一处
+  # 供应链和版本漂移的风险。这里只需要 openssh，runner 上本来就有。
+  #
+  # 刻意【不】在服务器上 docker image prune：留着旧镜像，回滚才有东西可回。
+  # 代价是磁盘会慢慢涨，需要时手动清（40G 盘，不急）。
+  deploy:
+    needs: [publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 配置 SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          # 先显式检查：secret 没配时，报一句人话，而不是让 ssh 报
+          # "Permission denied" 让人去猜到底是密钥错还是压根没配。
+          if [[ -z "$DEPLOY_SSH_KEY" || -z "$DEPLOY_KNOWN_HOSTS" ]]; then
+            echo "::error::缺少 DEPLOY_SSH_KEY 或 DEPLOY_KNOWN_HOSTS，见 README 的 CD 一节"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+
+          # 私钥必须 600 —— ssh 会拒绝加载权限过宽的私钥，
+          # 而报错只说 "bad permissions"，不说该怎么办。
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # 主机密钥来自 secret，不用 ssh-keyscan：keyscan 是 TOFU
+          # （第一次连上谁就信谁），中间人只要赢那一次就够了。
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 拉取新镜像并重启
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          if [[ -z "$DEPLOY_HOST" ]]; then
+            echo "::error::缺少 DEPLOY_HOST，见 README 的 CD 一节"
+            exit 1
+          fi
+
+          # 远端脚本走 stdin（bash -s + 带引号的 heredoc），
+          # 这样整段脚本不用塞进 ssh 的单引号里 —— 省掉一层转义地狱，
+          # 也就不用为了转义把脚本写走样。
+          #
+          # BatchMode=yes：密钥不通时立刻失败，而不是挂在那里等密码输入
+          # （CI 里没人能输入密码，等就是一个必然的超时）。
+          ssh -i ~/.ssh/deploy_key \
+              -o IdentitiesOnly=yes \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              "ubuntu@$DEPLOY_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          cd ~/todo-app
+
+          docker compose pull
+          docker compose up -d --no-build
+
+          # 等"真的能接流量"，而不是等容器 Up。
+          # 刚起来的几秒里容器状态就是 Up，但后端可能还没连上数据库 ——
+          # /readyz 会连带检查数据库连通性，这才是可接流的信号。
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1/readyz >/dev/null 2>&1; then
+              echo "部署完成：服务已就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "等待超时，导出日志："
+          docker compose logs --tail=50
+          exit 1
+          REMOTE

@@ -387,8 +387,9 @@ ACT_LOCAL_ACTIONS=1 ./scripts/act.sh -j backend
 仓库没有 remote，`on: push` 不可能被触发。推送之后该结论已闭环，
 本机 act 与真实 runner 的结果一致。
 
-上面新增的 `flutter` job 是在真实 runner 验证**之后**才补的，所以它目前只在本机
-`act` 里跑过，还没走过真实 runner —— 下一次 push 才会第一次得到验证。
+上面新增的 `flutter` 和 `deploy` 两个 job 是在真实 runner 验证**之后**才补的，
+所以它们还没走过真实 runner —— 下一次 push 才会第一次得到验证。
+（`deploy` 的那段远端脚本本身已经手动实测通过：拉镜像 → 重建 → `/readyz` 就绪。）
 
 ## CD：镜像推送与消费
 
@@ -422,8 +423,50 @@ docker compose pull && docker compose up -d
 **首次推送后要去仓库设置里把包的可见性改成 public**（或让部署端登录 ghcr）。
 ghcr 的包默认是 private，不登录拉不动，而报错只说 `denied`，不会提示是这个原因。
 
-### 为什么没有 deploy job
+### deploy job（自动部署）
 
-推镜像只需要 GitHub 自己发的 `GITHUB_TOKEN`，不需要任何外部凭据，是真正能跑通的；
-而部署需要一整套真实基础设施（服务器、SSH 私钥、服务器上的目录），写进来只会让它
-"看起来完整"，实际既无法执行也无法验证。部署怎么做取决于你的环境，不该由模板猜。
+`deploy` 需要 `publish`，只在 `main` 的 push 上跑：SSH 到服务器 →
+`docker compose pull` → `up -d --no-build` → 轮询 `/readyz` 直到真的能接流量。
+
+用裸 `ssh` 而不是 `appleboy/ssh-action`：少一个第三方 action 就少一处供应链
+和版本漂移的风险，而这里只需要 openssh，runner 上本来就有。
+
+**需要的三个 secrets**（仓库 → Settings → Secrets and variables → Actions）：
+
+| secret | 内容 |
+|---|---|
+| `DEPLOY_SSH_KEY` | 专用部署私钥，整份内容（含首尾行） |
+| `DEPLOY_HOST` | 服务器地址 |
+| `DEPLOY_KNOWN_HOSTS` | 服务器主机密钥，即 `ssh-keyscan -t ed25519,rsa <host>` 的输出 |
+
+两个刻意的选择：
+
+- **主机密钥走 secret，而不是在 job 里 `ssh-keyscan`**。keyscan 是 TOFU
+  （第一次连上谁就信谁），中间人只要赢那一次就够了。
+- **用专用部署密钥，不是个人密钥**。要作废时只需从服务器 `authorized_keys`
+  里删掉那一行，不影响个人身份的其它用途。
+
+**`deploy` 刻意不挂 `flutter`**：它的 `needs` 是 `[publish]`，而 `publish` 只依赖
+backend / web / e2e。Flutter 客户端是可选件（理由同 nginx 配置里那条），
+它挂了会让 CI 变红，但不该冻结服务端部署。
+
+**回滚**：`deploy` 拉的是 `:latest`，所以要回退到某个具体 commit，
+得在服务器上显式指定 sha 标签：
+
+```bash
+API_IMAGE=ghcr.io/owner/repo/api:sha-<旧commit> \
+WEB_IMAGE=ghcr.io/owner/repo/web:sha-<旧commit> \
+docker compose pull && docker compose up -d --no-build
+```
+
+job 里刻意**不做** `docker image prune` —— 留着旧镜像，回滚才有东西可回。
+代价是服务器磁盘会慢慢涨，需要时手动清。
+
+### 这一节原来写的是"为什么没有 deploy job"
+
+原来的理由是：部署需要一整套真实基础设施（服务器、SSH 私钥、服务器上的目录），
+在模板里凭空写一个既跑不了也验证不了，所以不该由模板猜。
+
+那个判断在当时是对的。后来服务器真实存在了、也确实在跑这个项目，
+部署才第一次变得**可执行、可验证** —— 于是补上。
+这不是"把模板补完整了"，而是终于有了真实的落点。
