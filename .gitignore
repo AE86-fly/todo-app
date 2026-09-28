@@ -33,3 +33,7 @@ app/.dart_tool/
 *~
 .DS_Store
 Thumbs.db
+
+# SSH 私钥，绝不能提交
+*.pem
+mypc.pem

@@ -74,6 +74,7 @@ ACTIONS=(
   "actions/checkout:v4"
   "actions/setup-go:v5"
   "actions/setup-node:v4"
+  "subosito/flutter-action:v2"
   "docker/setup-buildx-action:v3"
   "docker/login-action:v3"
   "docker/build-push-action:v6"

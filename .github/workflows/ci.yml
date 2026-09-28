@@ -10,10 +10,11 @@
 # 所以：本地绿了不代表 CI 一定绿（工具链版本可能不同），
 # 反过来也一样。两边都跑才算数。
 #
-# ⚠️ 这个文件尚未在真实 runner 上运行过。
-#    本目录当前不是 git 仓库，没有 remote，`on: push` 不可能被触发。
-#    推到 GitHub 之后它才会真正生效 —— 在那之前，请不要把它当作
-#    "CI 是通的"的证据。
+# ✅ 已在真实 GitHub runner 上验证过：run #1（commit 9445e94）四个 job 全绿，
+#    与本地 act 的结论一致。
+#
+#    （此前这里写的是"尚未在真实 runner 上运行过"——那是当时的真实状态：
+#    仓库没有 remote，`on: push` 触发不了。推送后该结论已闭环，故更新。）
 #
 # 有 publish job（推镜像到 ghcr.io），但**仍然没有 deploy job**。
 #
@@ -104,6 +105,41 @@ jobs:
         working-directory: web
         run: npm run build
 
+  # Flutter 客户端的静态检查与测试。
+  #
+  # 这个 job 是补上的：在此之前，本文件头部和 README 都写着"覆盖的步骤与
+  # `make check` 相同（含 flutter analyze / flutter test）"，但 CI 里根本没有
+  # Flutter —— `make check` 会跑，CI 从来不跑。那句话当时是不成立的。
+  # 补上之后口径才真正一致：Flutter 改动现在也会被 PR 拦住。
+  #
+  # 用 subosito/flutter-action 而不是手装 SDK：它会缓存 SDK 和 pub 依赖，
+  # 第二次之后拉起开销可以忽略。
+  #
+  # 版本钉死成和开发机相同的 3.47.5。不钉的话默认装 latest stable，
+  # 上游某天发版会让 CI 无声地换一套环境 —— 那时候红/绿的含义就变了。
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+
+      - name: 下载依赖
+        working-directory: app
+        run: flutter pub get
+
+      - name: 静态检查
+        working-directory: app
+        run: flutter analyze
+
+      - name: 测试
+        working-directory: app
+        run: flutter test
+
   # 端到端：把整套真正拉起来，跑 scripts/verify.sh 里的那些断言。
   #
   # 这一步不能省。前面两个 job 全绿，也只说明"各层自己没问题"——
@@ -149,6 +185,11 @@ jobs:
 
   # 测试全过了才推镜像。三个 job 都 needs 上，任何一个挂了都不会推 ——
   # 避免"测试失败但镜像已经发出去了"这种最难收拾的状态。
+  #
+  # flutter 刻意【不】挂在这里。理由和 nginx 配置里那条"Flutter 是可选件、
+  # 不该拖累主链路"是同一个：publish 产出的 api / web 镜像与 Flutter 客户端
+  # 毫无关系，把它挂进来会让客户端测试失败直接冻结服务端部署。
+  # Flutter 挂了自己会红，但不拦发布。
   publish:
     needs: [backend, web, e2e]
     # 只在 main 的 push 上推。PR 也推的话，任何人都能往 registry 里塞镜像。

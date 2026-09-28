@@ -159,7 +159,7 @@ make type-check-host   # 需要本机装了 Node
 | `make flutter-analyze` / `flutter-test` | Flutter 静态检查与测试（6 个） |
 | `make flutter-web` / `flutter-linux` | Flutter 两个平台的构建（web 已端到端验证；桌面版见下文说明） |
 | `make verify` | 端到端：对已启动的服务跑 35 项断言 |
-| `make check` | 上面这些的合集（见下），覆盖面与 CI 相同 |
+| `make check` | 上面这些的合集（见下），检查项与 CI 一致（CI 另多 `e2e` 和构建） |
 
 `make check` = `vet-go` + `test-go` + `type-check` + `flutter-analyze` + `flutter-test`。加 `-host` 后缀可切回宿主机版本（应急用，见上一节）。
 
@@ -309,12 +309,14 @@ Docker Hub 直连在这台机器上也不通，靠 daemon 配置的国内 mirror
 
 ## CI
 
-`.github/workflows/ci.yml` 覆盖的步骤与 `make check` 相同（`go vet` / `go test` / `vue-tsc` / `flutter analyze` / `flutter test`），但**机制不同**：
+`.github/workflows/ci.yml` 覆盖的检查项与 `make check` 一致（`go vet` / `go test` /
+`vue-tsc` / `flutter analyze` / `flutter test`），另外多出 `e2e`（起整套栈跑
+`scripts/verify.sh`）和两处构建。但**机制不同**：
 
 | | 工具链来自 | 为什么 |
 |---|---|---|
 | `make check` | 容器（挂载编译） | 保证和发布构建同一套环境 |
-| CI | runner 自带的 Go / Node（`setup-go` / `setup-node` 固定版本） | runner 本身就是一次性的、版本已被钉死，每次再构建两个工具链镜像纯属浪费 |
+| CI | runner 自带的 Go / Node（`setup-go` / `setup-node`），Flutter 由 `subosito/flutter-action` 装 | runner 本身就是一次性的、版本已被钉死，每次再构建两个工具链镜像纯属浪费 |
 
 所以**本地绿了不代表 CI 一定绿**（工具链版本可能不同），反过来也一样。两边都跑才算数。
 
@@ -353,9 +355,9 @@ ACT_LOCAL_ACTIONS=1 ./scripts/act.sh -j backend
   项目名和你本地那个栈完全相同，它会直接重建你的容器、抢 8081 端口。跑之前先
   `docker compose down`，跑完再 `make up`。
 
-### 验证结果（2026-09-27）
+### 验证结果
 
-三个能跑的 job 都真正执行过，全部通过：
+**本机 act（2026-09-27）** —— 当时存在的三个可跑 job 都真正执行过，全部通过：
 
 | job | 结果 |
 |---|---|
@@ -363,6 +365,15 @@ ACT_LOCAL_ACTIONS=1 ./scripts/act.sh -j backend
 | `web` | ✅ checkout → setup-node → `npm ci` → `vue-tsc` → `vite build` |
 | `e2e` | ✅ 起栈 → 等健康 → **35/35 断言全过** |
 | `publish` | ⚠️ 未验证（需要 registry 凭据） |
+
+**真实 GitHub runner（2026-09-27，run #1 @ `9445e94`）** —— 四个 job 全绿：
+
+| job | 结果 | 耗时 |
+|---|---|---|
+| `backend` | ✅ | 191s |
+| `web` | ✅ | 16s |
+| `e2e` | ✅ 35/35 断言 | 110s |
+| `publish` | ✅ 已推镜像到 ghcr.io | 117s |
 
 **它抓到了一个真实的 bug**：`.gitignore` 里的 `server` 本意是排除本地编译出的二进制，
 但它会匹配任意层级下名为 `server` 的**目录** —— 于是 `backend/cmd/server/main.go`
@@ -372,13 +383,16 @@ ACT_LOCAL_ACTIONS=1 ./scripts/act.sh -j backend
 这正是 e2e job 存在的意义：前面的单元测试和类型检查全绿，也发现不了"仓库根本不完整"。
 已修复（产物路径改成锚定的 `/backend/server`）。
 
-**仍未在真实 GitHub runner 上运行过** —— 这台机器没有 remote，`on: push` 不可能被触发。
-act 与真实 runner 的差异主要在：runner 镜像版本、系统工具、并发行为。
-推到 GitHub 之后才能说"CI 在真实环境上也是通的"。
+**这一节此前写着"仍未在真实 GitHub runner 上运行过"** —— 那是当时的真实状态：
+仓库没有 remote，`on: push` 不可能被触发。推送之后该结论已闭环，
+本机 act 与真实 runner 的结果一致。
+
+上面新增的 `flutter` job 是在真实 runner 验证**之后**才补的，所以它目前只在本机
+`act` 里跑过，还没走过真实 runner —— 下一次 push 才会第一次得到验证。
 
 ## CD：镜像推送与消费
 
-`publish` job 在三个测试 job 全过后，把 api / web 两个镜像推到 ghcr.io：
+`publish` job 在四个测试 job 全过后，把 api / web 两个镜像推到 ghcr.io：
 
 ```
 ghcr.io/<owner>/<repo>/api:sha-<commit>
